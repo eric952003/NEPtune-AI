@@ -33,11 +33,12 @@ def load_heavy_resources():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch_dtype = torch.float16 if device == "cuda" else torch.float32
     
+    # 強制使用 CPU 載入，避開雲端無 GPU 的報錯
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=torch_dtype,
-        device_map="auto",
+        torch_dtype=torch.float32,  # CPU 模式下使用 float32 最穩定
         trust_remote_code=True
+    ).to("cpu")
     )
     return tokenizer, model, rag
 
