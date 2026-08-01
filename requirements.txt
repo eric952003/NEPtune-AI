@@ -1,4 +1,7 @@
-torch
 streamlit
+torch
+transformers
+chromadb
+sentence-transformers
 jieba
-numpy
+opencc
