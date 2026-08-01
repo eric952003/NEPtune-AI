@@ -29,17 +29,14 @@ def load_heavy_resources():
     model_id = "Qwen/Qwen2.5-1.5B-Instruct"
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     
-    # 根據硬體自動選擇用 CPU 或半精度
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch_dtype = torch.float16 if device == "cuda" else torch.float32
-    
-    # 強制使用 CPU 載入，避開雲端無 GPU 的報錯
+    # 強制指定使用 CPU 運行，並確保括號完全正確對應
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=torch.float32,  # CPU 模式下使用 float32 最穩定
+        torch_dtype=torch.float32,
         trust_remote_code=True
-    ).to("cpu")
     )
+    model = model.to("cpu")
+    
     return tokenizer, model, rag
 
 tokenizer, model, rag = load_heavy_resources()
