@@ -1,183 +1,109 @@
 import streamlit as st
 import torch
-import torch.nn as nn
-from torch.nn import functional as F
-import jieba
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from rag_engine import BiotechRAG  # 引入我們之前寫好的 RAG 檢索引擎
 
 # ------------------------------
 # 1. 網頁基本設定與側邊欄
 # ------------------------------
-st.set_page_config(page_title="專屬生技 AI 助理", page_icon="🧬", layout="centered")
-st.title("🧬 專屬生技 AI 助理")
-st.markdown("這是一個由你自己親手打造的 Transformer 語言模型，具備基礎生物化學與分生技術知識。")
+st.set_page_config(page_title="Qwen 生技 AI RAG 助理", page_icon="🧬", layout="centered")
+st.title("🧬 專屬生技 AI 智能助理 (Qwen 2.5 + RAG 旗艦版)")
+st.markdown("結合了 **Qwen 2.5-1.5B 開源旗艦大模型** 與 **ChromaDB 向量檢索**，提供業界最高水準的生技專業問答！")
 
 with st.sidebar:
-    st.header("⚙️ 生成參數設定")
-    temperature = st.slider("創造力 (Temperature)", min_value=0.1, max_value=2.0, value=1.1, step=0.1)
-    top_p = st.slider("核抽樣 (Top-p)", min_value=0.1, max_value=1.0, value=0.9, step=0.05)
-    max_tokens = st.slider("生成長度 (Max Words)", min_value=10, max_value=300, value=100, step=10)
-    st.info("💡 提示：輸入一個生技專有名詞（如：微生物、蛋白質、酵素），AI 會自動接續完成該領域的專業論述。")
+    st.header("⚙️ 生成參數控制")
+    n_results = st.slider("檢索知識片段數 (RAG Top-k)", min_value=1, max_value=5, value=2, step=1)
+    temperature = st.slider("創造力 (Temperature)", min_value=0.1, max_value=1.5, value=0.7, step=0.1)
+    max_tokens = st.slider("最大回覆長度 (Max Tokens)", min_value=50, max_value=500, value=250, step=50)
+    st.info("💡 提示：輸入你想了解的生技主題（例如：PCR、基因工程、酵素），系統會自動檢索資料庫並由 Qwen 大模型為你深度解答。")
 
 # ------------------------------
-# 2. 模型架構定義 (必須與訓練時完全一致)
-# ------------------------------
-block_size = 32
-n_embd = 64
-n_head = 4
-n_layer = 3
-dropout = 0.2
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-class Head(nn.Module):
-    def __init__(self, head_size):
-        super().__init__()
-        self.key = nn.Linear(n_embd, head_size, bias=False)
-        self.query = nn.Linear(n_embd, head_size, bias=False)
-        self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.dropout = nn.Dropout(dropout)
-    def forward(self, x):
-        T = x.size(1)
-        k = self.key(x)
-        q = self.query(x)
-        v = self.value(x)
-        wei = q @ k.transpose(-2, -1) * (k.shape[-1] ** -0.5)
-        tril = torch.tril(torch.ones(T, T))
-        wei = wei.masked_fill(tril == 0, float('-inf'))
-        wei = F.softmax(wei, dim=-1)
-        wei = self.dropout(wei)
-        return wei @ v
-
-class MultiHeadAttention(nn.Module):
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(n_embd, n_embd)
-        self.dropout = nn.Dropout(dropout)
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
-        return out
-
-class FeedForward(nn.Module):
-    def __init__(self, n_embd):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(dropout)
-        )
-    def forward(self, x):
-        return self.net(x)
-
-class Block(nn.Module):
-    def __init__(self, n_embd, n_head):
-        super().__init__()
-        head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
-        self.ffwd = FeedForward(n_embd)
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
-        return x
-
-class TransformerLanguageModel(nn.Module):
-    def __init__(self, vocab_size):
-        super().__init__()
-        self.token_embedding = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, vocab_size)
-    def forward(self, idx):
-        T = idx.size(1)
-        tok_emb = self.token_embedding(idx)
-        pos_emb = self.position_embedding(torch.arange(T, device=device))
-        x = tok_emb + pos_emb
-        x = self.blocks(x)
-        x = self.ln_f(x)
-        logits = self.lm_head(x)
-        return logits
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_p=0.9):
-        self.eval() 
-        for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
-            logits = self(idx_cond)
-            logits = logits[:, -1, :] / temperature
-            probs = F.softmax(logits, dim=-1)
-            
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-            sorted_indices_to_remove[..., 0] = 0
-            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-            probs[indices_to_remove] = 0.0
-            probs = probs / probs.sum(dim=-1, keepdim=True)
-            
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
-
-# ------------------------------
-# 3. 資源快取與初始化 (確保網頁流暢度)
+# 2. 快取載入 Qwen 大模型與 RAG 引擎
 # ------------------------------
 @st.cache_resource
-def load_resources():
-    # 讀取原本的資料集來重建字典
-    with open('dataset.txt', 'r', encoding='utf-8') as f:
-        text = f.read()
-    words = jieba.lcut(text)
-    unique_words = sorted(list(set(words)))
-    vocab_size = len(unique_words)
+def load_heavy_resources():
+    print("📥 正在載入 RAG 檢索引擎...")
+    rag = BiotechRAG(dataset_path="dataset.txt")
     
-    stoi = { w:i for i,w in enumerate(unique_words) }
-    itos = { i:w for i,w in enumerate(unique_words) }
+    print("📥 正在載入 Qwen 2.5 開源大模型...")
+    model_id = "Qwen/Qwen2.5-1.5B-Instruct"
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     
-    # 載入模型權重
-    model = TransformerLanguageModel(vocab_size).to(device)
-    model.load_state_dict(torch.load('biotech_model_ultimate.pth', map_location=device))
+    # 根據硬體自動選擇用 CPU 或半精度
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch_dtype = torch.float16 if device == "cuda" else torch.float32
     
-    return model, stoi, itos
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch_dtype,
+        device_map="auto",
+        trust_remote_code=True
+    )
+    return tokenizer, model, rag
 
-model, stoi, itos = load_resources()
-
-# 編碼與解碼函數
-encode = lambda s: [stoi[w] for w in jieba.lcut(s) if w in stoi]
-decode = lambda l: ''.join([itos[i] for i in l])
+tokenizer, model, rag = load_heavy_resources()
 
 # ------------------------------
-# 4. 對話介面互動邏輯
+# 3. 對話介面互動邏輯
 # ------------------------------
-# 儲存對話紀錄
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# 顯示過去的對話
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# 接收使用者輸入
-if prompt := st.chat_input("請輸入開頭詞彙，例如：酵素、DNA、培養基..."):
-    # 顯示使用者的輸入
+if prompt := st.chat_input("請輸入生技主題，例如：PCR 的原理、基因工程..."):
     with st.chat_message("user"):
         st.markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
 
-    # AI 生成回應
     with st.chat_message("assistant"):
-        with st.spinner("思考中..."):
-            encoded_input = encode(prompt)
-            if not encoded_input:
-                response = "⚠️ 字典中找不到這個詞彙，請嘗試輸入資料集內存在過的生技專有名詞。"
-            else:
-                context = torch.tensor(encoded_input, dtype=torch.long, device=device).unsqueeze(0)
-                out = model.generate(context, max_new_tokens=max_tokens, temperature=temperature, top_p=top_p)
-                response = decode(out[0].tolist())
+        with st.spinner("🔍 Qwen 正在檢索知識庫並深度思考中..."):
+            # 1. 透過 RAG 檢索最相關的知識片段
+            retrieved_chunks = rag.search(prompt, n_results=n_results)
             
-            st.markdown(response)
+            # 2. 組合檢索到的上下文作為 Prompt 的一部份 (RAG 核心)
+            context_text = "\n".join([f"- {chunk}" for chunk in retrieved_chunks])
+            
+            system_prompt = (
+                "你是一個專業的生物科技專家助理。請根據以下提供的「參考知識庫」，"
+                "以精準、專業且流暢的繁體中文回答使用者問題。如果知識庫中沒有直接答案，請發揮你的專業知識進行補充。\n\n"
+                f"【參考知識庫】：\n{context_text}"
+            )
+            
+            # 3. 透過 Qwen 構建對話訊息
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ]
+            
+            text_input = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            
+            model_inputs = tokenizer([text_input], return_tensors="pt").to(model.device)
+            
+            # 4. 讓 Qwen 大模型生成回答
+            generated_ids = model.generate(
+                **model_inputs,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id
+            )
+            
+            generated_ids = [
+                output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+            ]
+            
+            response_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+            
+            # 5. 組合最終輸出格式 (展示檢索依據 + 大模型回答)
+            final_output = f"### 📚 知識庫檢索依據 (RAG)：\n{context_text}\n\n### 🤖 Qwen 專業生技專家解答：\n{response_text}"
+            
+            st.markdown(final_output)
     
-    st.session_state.messages.append({"role": "assistant", "content": response})
+    st.session_state.messages.append({"role": "assistant", "content": final_output})
